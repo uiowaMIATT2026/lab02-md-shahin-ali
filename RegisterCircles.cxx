@@ -11,18 +11,15 @@
 #include "itkRegularStepGradientDescentOptimizer.h"
 #include "itkLinearInterpolateImageFunction.h"
 #include "itkSimilarity2DTransform.h"
-#include "itkCenteredTransformInitializer.h"
 #include "itkResampleImageFilter.h"
-#include "itkCastImageFilter.h"
 
-// I am using float pixels because registration metrics need non-integer values
-using PixelType    = float;
-using ImageType    = itk::Image<PixelType, 2>;
+// float pixels needed for registration metric computations
+using PixelType  = float;
+using ImageType  = itk::Image<PixelType, 2>;
 
-// Helper function to create a 2D circle image programmatically
-// center_x, center_y: center of circle in mm
-// diameter: diameter of circle in mm
-// image_size: number of pixels per side
+// Create a 2D image with a filled circle
+// center_x, center_y in pixels (== mm since spacing=1)
+// diameter in mm
 ImageType::Pointer
 CreateCircleImage(double center_x, double center_y, double diameter,
                   unsigned int image_size = 512)
@@ -42,7 +39,7 @@ CreateCircleImage(double center_x, double center_y, double diameter,
   region.SetIndex(start);
   image->SetRegions(region);
 
-  // 1mm spacing so index space == physical space in mm
+  // spacing = 1mm so index == physical coordinate in mm
   ImageType::SpacingType spacing;
   spacing[0] = 1.0;
   spacing[1] = 1.0;
@@ -58,13 +55,12 @@ CreateCircleImage(double center_x, double center_y, double diameter,
 
   double radius = diameter / 2.0;
 
-  // Fill pixels inside the circle with intensity 255
   for(unsigned int j = 0; j < image_size; ++j)
     {
     for(unsigned int i = 0; i < image_size; ++i)
       {
-      double dx = i - center_x;
-      double dy = j - center_y;
+      double dx = static_cast<double>(i) - center_x;
+      double dy = static_cast<double>(j) - center_y;
       if( (dx*dx + dy*dy) <= (radius*radius) )
         {
         ImageType::IndexType idx;
@@ -79,13 +75,12 @@ CreateCircleImage(double center_x, double center_y, double diameter,
 
 int main(int argc, char* argv[])
 {
-  // Create the two circle images
-  // img1: 30mm diameter, centered at (50,50)mm
-  // img2: 60mm diameter, centered at (200,200)mm
+  // img1: fixed image  -- 30mm diameter circle at (50,50)mm
+  // img2: moving image -- 60mm diameter circle at (200,200)mm
   ImageType::Pointer fixedImage  = CreateCircleImage(50.0,  50.0,  30.0);
   ImageType::Pointer movingImage = CreateCircleImage(200.0, 200.0, 60.0);
 
-  // Save input images for inspection
+  // Save input images for verification
   {
   using WriterType = itk::ImageFileWriter<ImageType>;
   WriterType::Pointer w1 = WriterType::New();
@@ -98,12 +93,9 @@ int main(int argc, char* argv[])
   w2->Update();
   }
 
-  // Set up the Similarity2DTransform
-  // This handles translation + isotropic scale (+ rotation)
-  // 4 parameters: scale, angle, tx, ty
-  using TransformType   = itk::Similarity2DTransform<double>;
-  using OptimizerType   = itk::RegularStepGradientDescentOptimizer;
-  using MetricType      = itk::MeanSquaresImageToImageMetric<ImageType, ImageType>;
+  using TransformType    = itk::Similarity2DTransform<double>;
+  using OptimizerType    = itk::RegularStepGradientDescentOptimizer;
+  using MetricType       = itk::MeanSquaresImageToImageMetric<ImageType, ImageType>;
   using InterpolatorType = itk::LinearInterpolateImageFunction<ImageType, double>;
   using RegistrationType = itk::ImageRegistrationMethod<ImageType, ImageType>;
 
@@ -121,30 +113,37 @@ int main(int argc, char* argv[])
   registration->SetMovingImage(movingImage);
   registration->SetFixedImageRegion(fixedImage->GetLargestPossibleRegion());
 
-  // Initialize transform: center at fixed image center, identity otherwise
-  using InitializerType = itk::CenteredTransformInitializer
-    TransformType, ImageType, ImageType>;
-  InitializerType::Pointer initializer = InitializerType::New();
-  initializer->SetTransform(transform);
-  initializer->SetFixedImage(fixedImage);
-  initializer->SetMovingImage(movingImage);
-  initializer->MomentsOn();
-  initializer->InitializeTransform();
+  // Set initial transform parameters manually
+  // Similarity2DTransform has 4 parameters: scale, angle, tx, ty
+  // Start with scale=0.5 (img2 is 2x larger), angle=0, translation guess
+  TransformType::ParametersType initParams(transform->GetNumberOfParameters());
+  initParams[0] = 0.5;    // scale: img2 diameter is 2x img1 so scale ~ 0.5
+  initParams[1] = 0.0;    // angle: circles are rotation-invariant
+  initParams[2] = -150.0; // tx: shift from 200 to 50
+  initParams[3] = -150.0; // ty: shift from 200 to 50
+  transform->SetParameters(initParams);
+
+  // Set center of transform to center of moving image circle
+  TransformType::InputPointType center;
+  center[0] = 200.0;
+  center[1] = 200.0;
+  transform->SetCenter(center);
+
+  // Provide initial parameters to registration
+  registration->SetInitialTransformParameters(transform->GetParameters());
 
   // Optimizer settings
-  // Scale tells the optimizer how to balance the 4 parameters
   OptimizerType::ScalesType scales(transform->GetNumberOfParameters());
-  scales[0] = 10.0; // scale factor
-  scales[1] = 1.0;  // angle
+  scales[0] = 10.0;  // scale factor -- needs larger scale to balance with translation
+  scales[1] = 1.0;   // angle
   scales[2] = 0.001; // tx
   scales[3] = 0.001; // ty
   optimizer->SetScales(scales);
-  optimizer->SetMaximumStepLength(0.1);
+  optimizer->SetMaximumStepLength(1.0);
   optimizer->SetMinimumStepLength(0.001);
   optimizer->SetNumberOfIterations(300);
   optimizer->MinimizeOn();
 
-  // Run registration
   try
     {
     registration->Update();
@@ -155,7 +154,6 @@ int main(int argc, char* argv[])
     return EXIT_FAILURE;
     }
 
-  // Print results
   TransformType::ParametersType finalParams = registration->GetLastTransformParameters();
   std::cout << "======================================" << std::endl;
   std::cout << "Registration Results:" << std::endl;
@@ -167,7 +165,7 @@ int main(int argc, char* argv[])
   std::cout << "  Final metric : " << optimizer->GetValue() << std::endl;
   std::cout << "======================================" << std::endl;
 
-  // Resample moving image into fixed image space using the found transform
+  // Resample moving image into fixed image space
   using ResampleFilterType = itk::ResampleImageFilter<ImageType, ImageType>;
   ResampleFilterType::Pointer resampler = ResampleFilterType::New();
   resampler->SetInput(movingImage);
@@ -177,7 +175,6 @@ int main(int argc, char* argv[])
   resampler->SetDefaultPixelValue(0);
   resampler->Update();
 
-  // Save registered output
   using WriterType = itk::ImageFileWriter<ImageType>;
   WriterType::Pointer writer = WriterType::New();
   writer->SetInput(resampler->GetOutput());
